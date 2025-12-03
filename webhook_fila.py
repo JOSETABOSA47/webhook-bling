@@ -1,5 +1,4 @@
 import os
-# import pymysql # REMOVIDO: Usaremos o driver psycopg2 para PostgreSQL
 from flask import Flask, request, jsonify
 import logging
 from dotenv import load_dotenv
@@ -64,36 +63,41 @@ def get_db_connection():
         logging.error(f"Erro CRÍTICO ao pegar conexão do Pool: {e}")
         return None
 
+# --- 4. Gestão de Tokens Otimizada (Com Cache) ---
 def get_bling_token_for_account(nome_conta):
     current_ts = time.time()
-
+    
+    # 1. Tenta pegar do Cache de Memória (Zero Banco de Dados)
     if nome_conta in TOKEN_CACHE:
         cached = TOKEN_CACHE[nome_conta]
-        if cached['expires_at'] > (current_ts + 60):
+        if cached['expires_at'] > (current_ts + 60): # Margem de segurança
             return cached['token']
 
+    # 2. Se não tem no cache, vai no banco (Rapidinho)
     logging.info(f"[{nome_conta}] Buscando token no banco de dados...")
     conn = get_db_connection()
-    if not conn:
-        return None
-
-    try:
-        for tentativa_renovacao in range(1, 4):
+    if not conn: return None
+    
+    # Loop de retry para a renovação (3 tentativas)
+    for tentativa_renovacao in range(1, 4):
+        try:
             with conn.cursor() as cursor:
-                # consulta token
+                # PostgreSQL usa %s como placeholder
                 sql = f"SELECT client_id, client_secret, access_token, refresh_token, expires_at FROM {CONTAS_TABLE_NAME} WHERE nome_conta = %s"
                 cursor.execute(sql, (nome_conta,))
+                
                 row = cursor.fetchone()
-
                 if not row:
                     logging.error(f"Conta '{nome_conta}' não encontrada.")
                     return None
 
+                # Mapeia a tupla retornada para um dicionário
                 column_names = [desc[0] for desc in cursor.description]
                 conta_data = dict(zip(column_names, row))
-                expires_at = conta_data.get('expires_at') or 0
 
-                # token ainda válido
+                expires_at = conta_data.get('expires_at') or 0
+                
+                # Se token válido no banco, atualiza cache e retorna
                 if conta_data['access_token'] and expires_at > (current_ts + 60):
                     TOKEN_CACHE[nome_conta] = {
                         'token': conta_data['access_token'],
@@ -101,61 +105,54 @@ def get_bling_token_for_account(nome_conta):
                     }
                     return conta_data['access_token']
 
-                # renovar
+                # Se expirado, renova
                 logging.info(f"[{nome_conta}] Tentativa {tentativa_renovacao}: Renovando token...")
                 refresh_token = conta_data.get('refresh_token')
                 auth_str = f"{conta_data['client_id']}:{conta_data['client_secret']}"
                 auth_b64 = base64.b64encode(auth_str.encode()).decode()
-
+                
                 url = "https://www.bling.com.br/Api/v3/oauth/token"
-                headers = {
-                    'Authorization': f'Basic {auth_b64}',
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                }
-                payload = {
-                    'grant_type': 'refresh_token',
-                    'refresh_token': refresh_token
-                }
+                headers = {'Authorization': f'Basic {auth_b64}', 'Content-Type': 'application/x-www-form-urlencoded'}
+                payload = {'grant_type': 'refresh_token', 'refresh_token': refresh_token}
 
                 response = requests.post(url, headers=headers, data=payload)
-
+                
                 if response.status_code == 200:
                     new_data = response.json()
                     new_access_token = new_data['access_token']
                     new_expires_at = int(current_ts + new_data['expires_in'])
 
-                    update_sql = f"""
-                        UPDATE {CONTAS_TABLE_NAME}
-                        SET access_token = %s, refresh_token = %s, expires_at = %s
-                        WHERE nome_conta = %s
-                    """
-
-                    cursor.execute(update_sql, (
-                        new_access_token,
-                        new_data['refresh_token'],
-                        new_expires_at,
-                        nome_conta
-                    ))
+                    # Atualiza no banco
+                    update_sql = f"UPDATE {CONTAS_TABLE_NAME} SET access_token = %s, refresh_token = %s, expires_at = %s WHERE nome_conta = %s"
+                    cursor.execute(update_sql, (new_access_token, new_data['refresh_token'], new_expires_at, nome_conta))
                     conn.commit()
-
+                    
+                    # Atualiza Cache
                     TOKEN_CACHE[nome_conta] = {
                         'token': new_access_token,
                         'expires_at': new_expires_at
                     }
-
                     return new_access_token
-
+                
                 elif response.status_code in [400, 401]:
-                    logging.error(f"[{nome_conta}] ERRO FATAL (400/401). Refresh token inválido ou credenciais incorretas.")
-                    return None
-
+                    # Erro de credencial (refresh token inválido, client id/secret errado)
+                    logging.error(f"[{nome_conta}] Erro FATAL (400/401) na Renovação. Refresh token INVÁLIDO ou Credenciais incorretas.")
+                    return None # Sai do loop e da função sem tentar novamente
+                
                 else:
-                    logging.warning(f"[{nome_conta}] Erro {response.status_code}. Tentando novamente...")
+                    logging.warning(f"[{nome_conta}] Erro Renovação API: {response.status_code}. Tentando novamente em 5s...")
                     time.sleep(5)
-
-    finally:
-        conn.close()
-
+                    continue # Volta para a próxima tentativa do loop for
+                    
+        except Exception as e:
+            logging.error(f"Erro Token ({nome_conta}): {e}")
+            time.sleep(5) # Espera por erros de conexão DB/API
+            continue
+        finally:
+            if conn: conn.close()
+            
+    logging.error(f"[{nome_conta}] Falha persistente na renovação após 3 tentativas.")
+    return None
 
 # --- 5. API Call (SEM CONEXÃO DE BANCO ABERTA) ---
 def get_api_details_v3(endpoint, entity_id, nome_conta):
@@ -360,7 +357,9 @@ def worker_processamento():
             full_data = {}
             if event_type.startswith('order.'):
                 full_data = get_api_details_v3('pedidos/vendas', entity_id, conta_bling)
-            elif event_type.startswith('product.') or event_type == 'stock.updated':
+            elif event_type.startswith('product.'):
+                full_data = get_api_details_v3('produtos', entity_id, conta_bling)
+            elif event_type == 'stock.updated':
                 full_data = get_api_details_v3('produtos', entity_id, conta_bling)
 
             # 2. Salva no Banco (Rápido, abre e fecha)
@@ -387,11 +386,13 @@ def worker_processamento():
                 except Exception as e:
                     conn.rollback()
                     logging.error(f"❌ Erro SQL no Worker ({entity_id}): {e}")
+                    # Reenfileirar o item se houver erro SQL para nova tentativa
+                    processing_queue.put(task) 
                 finally:
                     if conn: conn.close() # DEVOLVE A CONEXÃO PRO POOL IMEDIATAMENTE
             else:
                 logging.error("❌ Worker não conseguiu conexão com DB. Reenfileirando...")
-                # Não fazemos sleep aqui porque o Worker pode tentar processar o próximo item se o banco estiver fora.
+                processing_queue.put(task)
         
         except Exception as e:
             logging.error(f"❌ Erro Genérico no Worker: {e}")
@@ -405,9 +406,14 @@ threading.Thread(target=worker_processamento, daemon=True).start()
 
 # --- 7. Handler Leve (Apenas Recebe) ---
 @app.route('/webhook-bling', methods=['POST'])
+@app.route('/', methods=['POST']) # <--- ADICIONADO ROTA DE FALLBACK PARA A RAIZ
 def handle_bling_webhook():
+    # Tenta pegar a conta do parâmetro de consulta. 
+    # Tenta pegar tanto de /?conta=x quanto de /webhook-bling?conta=x
     conta_bling = request.args.get('conta')
+    
     if not conta_bling:
+        logging.error("Falta parametro 'conta' na URL do webhook.")
         return jsonify({"status": "error", "message": "Falta parametro 'conta'"}), 400
 
     try:
