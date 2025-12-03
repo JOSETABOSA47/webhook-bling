@@ -89,7 +89,7 @@ def save_config(minutes):
 
 config = load_config()
 
-# --- 3. Conexão com Banco de Dados (CACHE OTIMIZADO) ---
+# --- 3. Conexão com Banco de Dados (CACHE OTIMIZADO) ----
 @st.cache_resource
 def get_engine():
     # CONFIGURAÇÃO CRÍTICA PARA POSTGRESQL (usando as variáveis .env)
