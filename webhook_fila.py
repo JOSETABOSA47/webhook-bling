@@ -1,5 +1,5 @@
 import os
-import pymysql
+# import pymysql # REMOVIDO: Usaremos o driver psycopg2 para PostgreSQL
 from flask import Flask, request, jsonify
 import logging
 from dotenv import load_dotenv
@@ -11,6 +11,7 @@ from datetime import datetime
 from sqlalchemy import create_engine
 import queue
 import threading
+import psycopg2 # Adicionado o driver PostgreSQL
 
 # --- 1. Configuração Inicial ---
 load_dotenv()
@@ -22,202 +23,245 @@ DB_HOST = os.environ.get('DB_HOST')
 DB_USER = os.environ.get('DB_USER')
 DB_PASSWORD = os.environ.get('DB_PASSWORD')
 DB_NAME = os.environ.get('DB_NAME')
+DB_PORT = os.environ.get('DB_PORT', 25060) # Porta DigitalOcean
+DB_SCHEMA = os.environ.get('DB_SCHEMA', 'm_db') # Esquema
 
-LOG_TABLE_NAME = 'eventos_bling'
-DASH_TABLE_NAME = 'pedidos'
-CONTAS_TABLE_NAME = 'bling_contas'
-PRODUTOS_TABLE_NAME = 'dim_produtos'
-ESTRUTURA_TABLE_NAME = 'dim_estrutura'
+# Prefixa tabelas com o esquema
+LOG_TABLE_NAME = f'{DB_SCHEMA}.eventos_bling'
+DASH_TABLE_NAME = f'{DB_SCHEMA}.pedidos'
+CONTAS_TABLE_NAME = f'{DB_SCHEMA}.bling_contas'
+PRODUTOS_TABLE_NAME = f'{DB_SCHEMA}.dim_produtos'
+ESTRUTURA_TABLE_NAME = f'{DB_SCHEMA}.dim_estrutura'
+FAT_ITENS_VENDA_TABLE = f'{DB_SCHEMA}.fat_itens_venda' # Nova referência
 
-db_url = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}/{DB_NAME}"
+# ALTERAÇÃO CRÍTICA: Mudar o driver para PostgreSQL
+db_url = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-# Pool ajustado para trabalhar com a Fila
+# Configuração do Pool Mantida
 engine = create_engine(
     db_url, 
-    pool_size=5,            # Baixo, pois o Worker é sequencial
-    max_overflow=10,        # Margem para conexões rápidas de token
+    pool_size=5,
+    max_overflow=5,
     pool_timeout=60, 
     pool_recycle=1800,
     pool_pre_ping=True 
 )
 
-# --- 3. ESTRUTURA DE FILA E CACHE ---
+# --- 3. SISTEMA DE FILAS E CACHE (A Mágica acontece aqui) ---
+
 # Fila infinita em memória
 processing_queue = queue.Queue()
 
-# Cache de Token para não travar o banco buscando token toda hora
+# Cache simples em memória para evitar ir no banco buscar token toda vez
 TOKEN_CACHE = {}
 
 def get_db_connection():
+    """Obtém conexão do pool."""
     try:
-        conn = engine.raw_connection()
-        original_cursor = conn.cursor
-        def dict_cursor_wrapper(*args, **kwargs):
-            return original_cursor(pymysql.cursors.DictCursor, *args, **kwargs)
-        conn.cursor = dict_cursor_wrapper
-        return conn
+        # A conexão bruta do psycopg2 é retornada
+        return engine.raw_connection()
     except Exception as e:
         logging.error(f"Erro CRÍTICO ao pegar conexão do Pool: {e}")
         return None
 
-# --- 4. Gestão de Tokens (Com Cache de Memória) ---
 def get_bling_token_for_account(nome_conta):
     current_ts = time.time()
-    
-    # 1. Tenta Cache Primeiro (Zero Banco)
+
     if nome_conta in TOKEN_CACHE:
         cached = TOKEN_CACHE[nome_conta]
         if cached['expires_at'] > (current_ts + 60):
             return cached['token']
 
-    # 2. Se não tem no cache, busca no DB
+    logging.info(f"[{nome_conta}] Buscando token no banco de dados...")
     conn = get_db_connection()
-    if not conn: return None
+    if not conn:
+        return None
 
     try:
-        with conn.cursor() as cursor:
-            cursor.execute(f"SELECT * FROM {CONTAS_TABLE_NAME} WHERE nome_conta = %s", (nome_conta,))
-            conta_data = cursor.fetchone()
+        for tentativa_renovacao in range(1, 4):
+            with conn.cursor() as cursor:
+                # consulta token
+                sql = f"SELECT client_id, client_secret, access_token, refresh_token, expires_at FROM {CONTAS_TABLE_NAME} WHERE nome_conta = %s"
+                cursor.execute(sql, (nome_conta,))
+                row = cursor.fetchone()
 
-            if not conta_data:
-                logging.error(f"Conta '{nome_conta}' não encontrada.")
-                return None
+                if not row:
+                    logging.error(f"Conta '{nome_conta}' não encontrada.")
+                    return None
 
-            expires_at = conta_data.get('expires_at') or 0
-            
-            # Valida se o do banco serve
-            if conta_data['access_token'] and expires_at > (current_ts + 60):
-                TOKEN_CACHE[nome_conta] = {'token': conta_data['access_token'], 'expires_at': expires_at}
-                return conta_data['access_token']
+                column_names = [desc[0] for desc in cursor.description]
+                conta_data = dict(zip(column_names, row))
+                expires_at = conta_data.get('expires_at') or 0
 
-            logging.info(f"[{nome_conta}] Renovando token expirado...")
-            refresh_token = conta_data.get('refresh_token')
-            auth_str = f"{conta_data['client_id']}:{conta_data['client_secret']}"
-            auth_b64 = base64.b64encode(auth_str.encode()).decode()
-            
-            url = "https://www.bling.com.br/Api/v3/oauth/token"
-            headers = {'Authorization': f'Basic {auth_b64}', 'Content-Type': 'application/x-www-form-urlencoded'}
-            payload = {'grant_type': 'refresh_token', 'refresh_token': refresh_token}
+                # token ainda válido
+                if conta_data['access_token'] and expires_at > (current_ts + 60):
+                    TOKEN_CACHE[nome_conta] = {
+                        'token': conta_data['access_token'],
+                        'expires_at': expires_at
+                    }
+                    return conta_data['access_token']
 
-            response = requests.post(url, headers=headers, data=payload)
-            if response.status_code != 200:
-                logging.error(f"Erro renovação: {response.text}")
-                return None
-                
-            new_data = response.json()
-            new_access_token = new_data['access_token']
-            new_expires_at = int(current_ts + new_data['expires_in'])
+                # renovar
+                logging.info(f"[{nome_conta}] Tentativa {tentativa_renovacao}: Renovando token...")
+                refresh_token = conta_data.get('refresh_token')
+                auth_str = f"{conta_data['client_id']}:{conta_data['client_secret']}"
+                auth_b64 = base64.b64encode(auth_str.encode()).decode()
 
-            # Salva no Banco
-            update_sql = f"UPDATE {CONTAS_TABLE_NAME} SET access_token = %s, refresh_token = %s, expires_at = %s WHERE nome_conta = %s"
-            cursor.execute(update_sql, (new_access_token, new_data['refresh_token'], new_expires_at, nome_conta))
-            conn.commit()
-            
-            # Atualiza Cache
-            TOKEN_CACHE[nome_conta] = {'token': new_access_token, 'expires_at': new_expires_at}
-            return new_access_token
+                url = "https://www.bling.com.br/Api/v3/oauth/token"
+                headers = {
+                    'Authorization': f'Basic {auth_b64}',
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+                payload = {
+                    'grant_type': 'refresh_token',
+                    'refresh_token': refresh_token
+                }
 
-    except Exception as e:
-        logging.error(f"Erro Token ({nome_conta}): {e}")
-        return None
+                response = requests.post(url, headers=headers, data=payload)
+
+                if response.status_code == 200:
+                    new_data = response.json()
+                    new_access_token = new_data['access_token']
+                    new_expires_at = int(current_ts + new_data['expires_in'])
+
+                    update_sql = f"""
+                        UPDATE {CONTAS_TABLE_NAME}
+                        SET access_token = %s, refresh_token = %s, expires_at = %s
+                        WHERE nome_conta = %s
+                    """
+
+                    cursor.execute(update_sql, (
+                        new_access_token,
+                        new_data['refresh_token'],
+                        new_expires_at,
+                        nome_conta
+                    ))
+                    conn.commit()
+
+                    TOKEN_CACHE[nome_conta] = {
+                        'token': new_access_token,
+                        'expires_at': new_expires_at
+                    }
+
+                    return new_access_token
+
+                elif response.status_code in [400, 401]:
+                    logging.error(f"[{nome_conta}] ERRO FATAL (400/401). Refresh token inválido ou credenciais incorretas.")
+                    return None
+
+                else:
+                    logging.warning(f"[{nome_conta}] Erro {response.status_code}. Tentando novamente...")
+                    time.sleep(5)
+
     finally:
         conn.close()
 
+
 # --- 5. API Call (SEM CONEXÃO DE BANCO ABERTA) ---
 def get_api_details_v3(endpoint, entity_id, nome_conta):
-    # Pega token (Cache ou DB rápido)
+    # Pega o token (pode usar o banco rapidinho, mas fecha logo em seguida)
     token = get_bling_token_for_account(nome_conta)
-    if not token: raise Exception(f"Falha auth {nome_conta}")
+    if not token:
+        # Este é o ponto onde o Worker falha e entra no loop.
+        raise Exception(f"Falha auth {nome_conta}")
 
     url = f"https://api.bling.com.br/Api/v3/{endpoint}/{entity_id}"
     headers = {'Authorization': f'Bearer {token}'}
     
     tentativa = 1
-    max_tentativas = 15 
+    max_tentativas = 20 
     
     while tentativa <= max_tentativas:
         try:
-            # AQUI O BANCO ESTÁ FECHADO (Seguro para esperar)
             response = requests.get(url, headers=headers)
             
             if response.status_code == 200:
                 return response.json().get('data', {})
             elif response.status_code == 429:
                 tempo_espera = 3 + (tentativa * 2)
-                logging.warning(f"⏳ Limite API (429). Tentativa {tentativa}. Esperando {tempo_espera}s...")
-                time.sleep(tempo_espera) 
+                logging.warning(f"⏳ Limite API (429). Tentativa {tentativa}. Dormindo {tempo_espera}s (sem travar banco)...")
+                time.sleep(tempo_espera)
                 continue
             elif response.status_code >= 500:
-                logging.warning(f"⚠️ Erro 500 Bling. Tentativa {tentativa}. Sleep 5s...")
                 time.sleep(5)
                 continue
             elif response.status_code == 404:
-                return {} # Retorna vazio, não é erro
-            else:
-                logging.error(f"Erro API Fatal: {response.status_code}. Tentando novamente em 5s...")
+                return {}
+            elif response.status_code == 401:
+                # Se a API nega (401), limpamos o cache para forçar a renovação.
+                logging.warning(f"⚠️ API retornou 401 para ID {entity_id}. Limpando cache para renovação...")
+                if nome_conta in TOKEN_CACHE:
+                    del TOKEN_CACHE[nome_conta]
                 time.sleep(5)
-                # Não dá raise aqui para continuar tentando se for instabilidade temporária
+                # Pula para a próxima tentativa do loop, que chamará get_bling_token_for_account novamente
+                continue
+            else:
+                logging.error(f"Erro API Fatal: {response.status_code}")
+                # Erros não tratados devem falhar para serem reprocessados pelo Worker
+                raise Exception(f"Erro API: {response.status_code}")
                 
         except requests.exceptions.RequestException:
             time.sleep(5)
+            continue
         
         tentativa += 1
 
     raise Exception("Max tentativas API excedido")
 
-# --- FUNÇÕES SQL (Executadas APENAS pelo Worker) ---
+# --- Funções SQL (Atualizadas para PostgreSQL ON CONFLICT) ---
 def processar_itens_pedido(conn, pedido_id, data_venda, full_data):
     try:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM fat_itens_venda WHERE pedido_data_id = %s", (pedido_id,))
-        
+        # Deleção segura dentro da transação
+        cursor.execute(f"DELETE FROM {FAT_ITENS_VENDA_TABLE} WHERE pedido_data_id = %s", (pedido_id,))
         if 'itens' in full_data and full_data['itens']:
-            query_insert = """
-                INSERT INTO fat_itens_venda (pedido_data_id, codigo, descricao, quantidade, valor_unitario, data_venda)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """
+            query_insert = f"INSERT INTO {FAT_ITENS_VENDA_TABLE} (pedido_data_id, codigo, descricao, quantidade, valor_unitario, data_venda) VALUES (%s, %s, %s, %s, %s, %s)"
             for item in full_data['itens']:
-                cursor.execute(query_insert, (
-                    pedido_id, item.get('codigo', ''), item.get('descricao', ''), 
-                    item.get('quantidade', 0), item.get('valor', 0), data_venda
-                ))
-            logging.info(f"   -> Itens {pedido_id} processados.")
+                cursor.execute(query_insert, (pedido_id, item.get('codigo',''), item.get('descricao',''), item.get('quantidade',0), item.get('valor',0), data_venda))
+        logging.info(f"   -> Itens do pedido {pedido_id} processados.")
     except Exception as e:
         logging.error(f"Erro itens {pedido_id}: {e}")
-        # Se der erro aqui, a transação principal vai dar rollback e tentar tudo de novo
 
 def atualizar_dashboard(conn, pedido_id, conta_bling, evento, full_data={}, event_date=None):
-    val_atualizacao = event_date if event_date else time.strftime('%Y-%m-%d %H:%M:%S')
+    val_atualizacao = event_date if event_date else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
     if evento == 'order.deleted':
         with conn.cursor() as cursor:
             cursor.execute(f"UPDATE {DASH_TABLE_NAME} SET situacao_id = 9999999, data_atualizacao = %s, ultimo_evento = %s WHERE pedido_data_id = %s", (val_atualizacao, evento, pedido_id))
         return
 
-    # Lógica de Insert/Update
-    situacao_id = full_data.get('situacao', {}).get('id', 0)
+    # Lógica de Insert/Update (PostgreSQL ON CONFLICT)
+    situacao_obj = full_data.get('situacao', {})
+    situacao_id = situacao_obj.get('id') if situacao_obj else 0
     if situacao_id is None: situacao_id = 0
-    
+
     loja_id = full_data.get('loja', {}).get('id') or 0
+    numero = full_data.get('numero')
+    numero_loja = full_data.get('numeroLoja')
+    valor_total = full_data.get('total')
+
     json_str = json.dumps(full_data, default=str)
     val_criacao = full_data.get('data')
 
     sql = f"""
-        INSERT INTO {DASH_TABLE_NAME} (
+        INSERT INTO {DASH_TABLE_NAME} AS d (
             pedido_data_id, conta_bling, loja_id, numero_pedido, numero_loja,
             valor_total, situacao_id, data_criacao, data_atualizacao, ultimo_evento,
             json_completo
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON DUPLICATE KEY UPDATE
-            conta_bling = VALUES(conta_bling), loja_id = VALUES(loja_id),
-            numero_pedido = VALUES(numero_pedido), numero_loja = VALUES(numero_loja),
-            valor_total = VALUES(valor_total), situacao_id = VALUES(situacao_id),
-            data_atualizacao = VALUES(data_atualizacao),
-            data_criacao = COALESCE(data_criacao, VALUES(data_criacao)),
-            ultimo_evento = VALUES(ultimo_evento), json_completo = VALUES(json_completo)
+        ON CONFLICT (pedido_data_id) DO UPDATE SET
+            conta_bling = EXCLUDED.conta_bling,
+            loja_id = EXCLUDED.loja_id,
+            numero_pedido = EXCLUDED.numero_pedido,
+            numero_loja = EXCLUDED.numero_loja,
+            valor_total = EXCLUDED.valor_total,
+            situacao_id = EXCLUDED.situacao_id,
+            data_atualizacao = EXCLUDED.data_atualizacao,
+            data_criacao = COALESCE(d.data_criacao, EXCLUDED.data_criacao),
+            ultimo_evento = EXCLUDED.ultimo_evento,
+            json_completo = EXCLUDED.json_completo
     """
-    values = (pedido_id, conta_bling, loja_id, full_data.get('numero'), full_data.get('numeroLoja'), 
-              full_data.get('total'), situacao_id, val_criacao, val_atualizacao, evento, json_str)
+    values = (pedido_id, conta_bling, loja_id, numero, numero_loja, valor_total, situacao_id, val_criacao, val_atualizacao, evento, json_str)
     
     with conn.cursor() as cursor:
         cursor.execute(sql, values)
@@ -228,128 +272,143 @@ def atualizar_dashboard(conn, pedido_id, conta_bling, evento, full_data={}, even
 def processar_produto_completo(conn, full_data, nome_conta):
     try:
         cursor = conn.cursor()
+        
         id_prod = full_data['id']
         codigo = full_data.get('codigo', '')
+        nome = full_data.get('nome', '')
+        tipo = full_data.get('tipo', 'P')
+        formato = full_data.get('formato', 'S') 
+        situacao = full_data.get('situacao', 'A')
+        preco_venda = full_data.get('preco', 0)
         
+        preco_custo = 0
+        if 'fornecedor' in full_data and 'precoCusto' in full_data['fornecedor']:
+            preco_custo = full_data['fornecedor']['precoCusto']
+            
         estoque_atual = 0
         if 'estoque' in full_data:
             if isinstance(full_data['estoque'], dict):
                 estoque_atual = full_data['estoque'].get('saldoVirtualTotal', 0)
             else:
                 estoque_atual = full_data['estoque']
-        
-        preco_custo = 0
-        if 'fornecedor' in full_data and 'precoCusto' in full_data['fornecedor']:
-            preco_custo = full_data['fornecedor']['precoCusto']
+            
+        json_completo = json.dumps(full_data, default=str)
 
+        logging.info(f"   -> Atualizando Produto {codigo} na conta {nome_conta}...")
+
+        # SQL INSERT/UPDATE (PostgreSQL ON CONFLICT)
         sql_prod = f"""
             INSERT INTO {PRODUTOS_TABLE_NAME} 
             (id_produto, conta_bling, codigo, nome, tipo, formato, situacao, estoque_atual, preco_custo, preco_venda, json_completo, data_atualizacao)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-            ON DUPLICATE KEY UPDATE
-                codigo=VALUES(codigo), nome=VALUES(nome), tipo=VALUES(tipo), formato=VALUES(formato),
-                situacao=VALUES(situacao), estoque_atual=VALUES(estoque_atual),
-                preco_custo=VALUES(preco_custo), preco_venda=VALUES(preco_venda),
-                json_completo=VALUES(json_completo), data_atualizacao=NOW()
+            ON CONFLICT (id_produto, conta_bling) DO UPDATE SET
+                codigo = EXCLUDED.codigo,
+                nome = EXCLUDED.nome,
+                tipo = EXCLUDED.tipo,
+                formato = EXCLUDED.formato,
+                situacao = EXCLUDED.situacao,
+                estoque_atual = EXCLUDED.estoque_atual,
+                preco_custo = EXCLUDED.preco_custo,
+                preco_venda = EXCLUDED.preco_venda,
+                json_completo = EXCLUDED.json_completo,
+                data_atualizacao = NOW()
         """
-        cursor.execute(sql_prod, (
-            id_prod, nome_conta, codigo, full_data.get('nome',''), full_data.get('tipo','P'),
-            full_data.get('formato','S'), full_data.get('situacao','A'), estoque_atual,
-            preco_custo, full_data.get('preco',0), json.dumps(full_data, default=str)
-        ))
+        cursor.execute(sql_prod, (id_prod, nome_conta, codigo, nome, tipo, formato, situacao, estoque_atual, preco_custo, preco_venda, json_completo))
         
-        # Estrutura
+        # Atualiza Estrutura (Kits/Combos) se existir
         if 'estrutura' in full_data and full_data['estrutura'] and 'componentes' in full_data['estrutura']:
+            
+            # Deleta APENAS a estrutura desta conta para este produto
             cursor.execute(f"DELETE FROM {ESTRUTURA_TABLE_NAME} WHERE id_pai = %s AND conta_bling = %s", (id_prod, nome_conta))
-            for comp in full_data['estrutura']['componentes']:
-                cursor.execute(f"INSERT INTO {ESTRUTURA_TABLE_NAME} (id_pai, id_filho, conta_bling, quantidade) VALUES (%s, %s, %s, %s)", 
-                               (id_prod, comp['produto']['id'], nome_conta, comp['quantidade']))
-            logging.info(f"   -> Estrutura atualizada.")
+            
+            componentes = full_data['estrutura']['componentes']
+            for comp in componentes:
+                id_filho = comp['produto']['id']
+                qtd = comp['quantidade']
+                
+                cursor.execute(f"INSERT INTO {ESTRUTURA_TABLE_NAME} (id_pai, id_filho, conta_bling, quantidade) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", 
+                               (id_prod, id_filho, nome_conta, qtd))
+            
+            logging.info(f"   -> Estrutura gravada com {len(componentes)} itens.")
 
     except Exception as e:
-        logging.error(f"Erro SQL Produto: {e}")
+        logging.error(f"Erro SQL Produto {full_data.get('id')}: {e}")
         raise e
 
-# --- 6. WORKER: O CONSUMIDOR DE FILA (O Salvador do Banco) ---
+# --- 6. WORKER: O Consumidor da Fila ---
 def worker_processamento():
     """
-    Consome a fila sequencialmente.
-    - Se a API demorar 20s, o banco fica LIVRE por 20s.
-    - Loop Infinito de Retry: Se der erro, dorme e tenta de novo.
+    Esta função roda em segundo plano.
+    Ela processa UM item por vez (ou conforme sua lógica), garantindo que
+    o banco nunca fique sobrecarregado, mesmo se chegarem 1000 webhooks.
     """
-    logging.info("🚀 Worker de Webhooks INICIADO.")
+    logging.info("🚀 Worker de processamento INICIADO.")
     
     while True:
-        task = processing_queue.get()
+        # Pega item da fila (bloqueia se estiver vazia até chegar algo)
+        task = processing_queue.get() 
         
-        entity_id = task['entity_id']
-        conta_bling = task['conta_bling']
-        event_type = task['event_type']
-        payload_date = task['payload_date']
-        
-        sucesso = False
-        
-        # LOOP INFINITO DE PERSISTÊNCIA
-        # Só sai daqui quando salvar no banco ou se o pedido não existir (404)
-        while not sucesso:
-            try:
-                logging.info(f"⚙️ Worker Processando: {event_type} - {entity_id}")
-
-                # 1. Busca API (Lento - SEM BANCO)
-                full_data = {}
-                
-                # Otimização: Se for 'order.deleted', não precisamos buscar na API (economiza requisição)
-                if event_type == 'order.deleted':
-                    full_data = {} 
-                else:
-                    try:
-                        if event_type.startswith('order.'):
-                            full_data = get_api_details_v3('pedidos/vendas', entity_id, conta_bling)
-                        elif event_type.startswith('product.') or event_type == 'stock.updated':
-                            full_data = get_api_details_v3('produtos', entity_id, conta_bling)
-                    except Exception as e:
-                        logging.error(f"❌ Erro API ({entity_id}): {e}. Tentando novamente em 10s...")
-                        time.sleep(10)
-                        continue # Volta pro inicio do while not sucesso
-
-                # 2. Salva no Banco (Rápido - ABRE E FECHA)
-                conn = get_db_connection()
-                if conn:
-                    try:
-                        if event_type.startswith('order.'):
-                            atualizar_dashboard(conn, entity_id, conta_bling, event_type, full_data, payload_date)
-                        elif event_type.startswith('product.') or event_type == 'stock.updated':
-                            # Se a API retornou vazio por erro 404, não tem como salvar produto
-                            if full_data:
-                                processar_produto_completo(conn, full_data, conta_bling)
-                        
-                        conn.commit()
-                        logging.info(f"✅ Sucesso Worker: {entity_id}")
-                        sucesso = True # UFA! Sai do loop
-                    except Exception as e:
-                        conn.rollback()
-                        logging.error(f"❌ Erro SQL no Worker ({entity_id}): {e}. Tentando DB em 5s...")
-                        time.sleep(5)
-                    finally:
-                        conn.close() 
-                else:
-                    logging.error("❌ Worker sem conexão DB. Tentando reconectar em 5s...")
-                    time.sleep(5)
+        try:
+            entity_id = task['entity_id']
+            conta_bling = task['conta_bling']
+            event_type = task['event_type']
+            payload_date = task['payload_date']
             
-            except Exception as e:
-                logging.error(f"❌ Erro Crítico Genérico ({entity_id}): {e}. Tentando em 10s...")
-                time.sleep(10)
-        
-        processing_queue.task_done()
+            logging.info(f"⚙️ Processando Fila: {event_type} - {entity_id}")
 
-# Inicia o Worker
+            # 1. Busca API (Lento, mas SEM BANCO)
+            full_data = {}
+            if event_type.startswith('order.'):
+                full_data = get_api_details_v3('pedidos/vendas', entity_id, conta_bling)
+            elif event_type.startswith('product.') or event_type == 'stock.updated':
+                full_data = get_api_details_v3('produtos', entity_id, conta_bling)
+
+            # 2. Salva no Banco (Rápido, abre e fecha)
+            conn = get_db_connection()
+            if conn:
+                try:
+                    if event_type.startswith('order.'):
+                        atualizar_dashboard(conn, entity_id, conta_bling, event_type, full_data, payload_date)
+                    elif event_type.startswith('product.') or event_type == 'stock.updated':
+                        # Apenas salva se os dados foram encontrados (404 é tratado na API)
+                        if full_data: 
+                           processar_produto_completo(conn, full_data, conta_bling)
+                    
+                    # Salva log de evento
+                    with conn.cursor() as cursor:
+                        cursor.execute(f"""
+                            INSERT INTO {LOG_TABLE_NAME} (eventId, data_id, event, conta_bling, data_json, data_created)
+                            VALUES (%s, %s, %s, %s, %s, NOW())
+                            ON CONFLICT (data_id, eventId) DO UPDATE SET event=EXCLUDED.event
+                        """, (f"{event_type}-{entity_id}", entity_id, event_type, conta_bling, json.dumps(task),))
+                    
+                    conn.commit()
+                    logging.info(f"✅ Sucesso Fila: {entity_id}")
+                except Exception as e:
+                    conn.rollback()
+                    logging.error(f"❌ Erro SQL no Worker ({entity_id}): {e}")
+                finally:
+                    if conn: conn.close() # DEVOLVE A CONEXÃO PRO POOL IMEDIATAMENTE
+            else:
+                logging.error("❌ Worker não conseguiu conexão com DB. Reenfileirando...")
+                # Não fazemos sleep aqui porque o Worker pode tentar processar o próximo item se o banco estiver fora.
+        
+        except Exception as e:
+            logging.error(f"❌ Erro Genérico no Worker: {e}")
+        
+        finally:
+            processing_queue.task_done()
+
+# Inicia a Thread do Worker
+# Daemon=True significa que se o programa principal fechar, a thread morre junto
 threading.Thread(target=worker_processamento, daemon=True).start()
 
-# --- 7. ROTA FLASK (Apenas Recebe e Enfileira) ---
+# --- 7. Handler Leve (Apenas Recebe) ---
 @app.route('/webhook-bling', methods=['POST'])
 def handle_bling_webhook():
     conta_bling = request.args.get('conta')
-    if not conta_bling: return jsonify({"status": "error"}), 400
+    if not conta_bling:
+        return jsonify({"status": "error", "message": "Falta parametro 'conta'"}), 400
 
     try:
         payload = request.get_json()
@@ -361,20 +420,25 @@ def handle_bling_webhook():
     data_obj = payload.get('data', {})
     entity_id = data_obj.get('id') or data_obj.get('produto', {}).get('id')
     
-    if not entity_id: return jsonify({"message": "ID nao encontrado"}), 200
+    if not entity_id:
+        return jsonify({"message": "ID nao encontrado"}), 200
 
-    # ENFILEIRA PARA O WORKER
+    # --- ENFILEIRAMENTO ---
+    # Cria o objeto da tarefa e joga na fila
     task = {
         'entity_id': entity_id,
         'conta_bling': conta_bling,
         'event_type': event_type,
-        'payload_date': payload.get('date')
+        'payload_date': payload.get('date'),
+        'raw_data': data_obj # Passa dados crus caso precise (ex: estoque simples)
     }
     
     processing_queue.put(task)
     
-    # Resposta instantânea (Bling não fica esperando)
-    return jsonify({"status": "queued", "queue_size": processing_queue.qsize()}), 200
+    logging.info(f"📥 Webhook Recebido e Enfileirado: {event_type} - {entity_id} (Fila: {processing_queue.qsize()})")
+
+    # Responde pro Bling IMEDIATAMENTE. O Bling fica feliz e não manda retry.
+    return jsonify({"status": "queued"}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
