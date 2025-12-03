@@ -124,7 +124,8 @@ def get_engine():
 def get_data():
     try:
         engine = get_engine()
-        # CORREÇÃO CRÍTICA: Adicionando o prefixo do esquema 'm_db' nas tabelas
+        # MUDANÇA: Tiramos o GROUP BY e o STRING_AGG. 
+        # Agora trazemos os dados do item (codigo, descricao, qtd, valor) diretamente.
         query = """
             SELECT 
                 p.pedido_data_id, 
@@ -133,27 +134,38 @@ def get_data():
                 p.valor_total, 
                 p.data_criacao,
                 COALESCE(ds.nome_situacao, p.situacao_id::text) AS nome_situacao,
-                COALESCE(dl.nome_loja, p.loja_id::text) AS nome_loja
+                COALESCE(dl.nome_loja, p.loja_id::text) AS nome_loja,
+                -- Colunas dos Itens (Filhos)
+                i.codigo AS item_codigo,
+                i.descricao AS item_descricao,
+                i.quantidade AS item_qtd,
+                i.valor_unitario AS item_valor
             FROM 
                 m_db.pedidos AS p
             LEFT JOIN 
                 m_db.dim_situacoes AS ds ON p.situacao_id = ds.situacao_id
             LEFT JOIN 
                 m_db.dim_lojas AS dl ON p.loja_id = dl.loja_id
+            -- JOIN para trazer as linhas dos produtos
+            LEFT JOIN
+                m_db.fat_itens_venda AS i ON p.pedido_data_id = i.pedido_data_id
             ORDER BY 
                 p.data_criacao DESC
         """
-        # Usando 'with' garante que a conexão fecha mesmo se der erro
         with engine.connect() as conn:
             df = pd.read_sql(query, conn)
         
         if not df.empty:
             df['data_criacao'] = pd.to_datetime(df['data_criacao'])
             df['valor_total'] = pd.to_numeric(df['valor_total'])
+            df['item_qtd'] = pd.to_numeric(df['item_qtd']).fillna(0)
+            df['item_valor'] = pd.to_numeric(df['item_valor']).fillna(0)
             df['situacao_normalizada'] = df['nome_situacao'].astype(str).str.strip()
+            
+            # Tratamento visual para itens nulos (pedidos sem produtos)
+            df['item_descricao'] = df['item_descricao'].fillna('Sem itens')
         return df
     except Exception as e:
-        # Se der erro, limpamos o cache para tentar conectar de novo na próxima
         st.cache_data.clear()
         st.error(f"Erro ao conectar no banco: {e}")
         return pd.DataFrame()
@@ -270,38 +282,48 @@ if not df.empty:
         
         st.divider()
 
-        # --- LISTAGEM DETALHADA ---
-        st.subheader(f"📦 Listagem Detalhada ({len(df_filtered)})")
+# --- LISTAGEM DETALHADA ---
+        st.subheader(f"📦 Listagem Detalhada de Itens ({len(df_filtered)})")
         
         tab1, tab2 = st.tabs(["Todos os Pedidos", "Apenas Pendentes"])
-        cols = ['data_criacao', 'conta_bling', 'numero_pedido', 'nome_situacao', 'nome_loja', 'valor_total']
         
+        # DEFINIÇÃO DAS COLUNAS
+        # 1. Colunas que serão o "AGRUPAMENTO" (Dados do Pedido)
+        index_cols = ['data_criacao', 'conta_bling', 'numero_pedido', 'nome_situacao', 'nome_loja', 'valor_total']
+        
+        # 2. Colunas que serão os "DETALHES" (Dados do Produto)
+        data_cols = ['item_codigo', 'item_descricao', 'item_qtd', 'item_valor']
+        
+        # Configuração visual das colunas
         col_config = {
-            "valor_total": st.column_config.NumberColumn("Valor Total", format="R$ %.2f"),
-            "data_criacao": st.column_config.DatetimeColumn("Data Criação", format="DD/MM/YYYY HH:mm"),
+            "valor_total": st.column_config.NumberColumn("Total Pedido", format="R$ %.2f"),
+            "data_criacao": st.column_config.DatetimeColumn("Data", format="DD/MM/YYYY"),
             "conta_bling": st.column_config.TextColumn("Conta"),
             "numero_pedido": st.column_config.TextColumn("Pedido"),
             "nome_situacao": st.column_config.TextColumn("Situação"),
             "nome_loja": st.column_config.TextColumn("Loja"),
+            # Itens
+            "item_codigo": st.column_config.TextColumn("SKU"),
+            "item_descricao": st.column_config.TextColumn("Produto / Descrição", width="large"),
+            "item_qtd": st.column_config.NumberColumn("Qtd"),
+            "item_valor": st.column_config.NumberColumn("Valor Unit.", format="R$ %.2f"),
         }
 
         with tab1:
+            # O set_index cria o visual hierárquico
             st.dataframe(
-                df_filtered[cols].sort_values(by='data_criacao', ascending=False),
+                df_filtered[index_cols + data_cols].sort_values(by='data_criacao', ascending=False).set_index(index_cols),
                 use_container_width=True,
-                hide_index=True,
                 column_config=col_config
             )
         
         with tab2:
-            # Corrigido: Usando a coluna normalizada para o filtro
-            mask_pend = df_filtered['situacao_normalizada'].str.contains('Em aberto|Em andamento|Pendente|Separação', case=False, na=False)
+            mask_pend = df_filtered['situacao_normalizada'].str.contains('Em aberto|Em andamento|Pendente|Separa', case=False, na=False)
             df_pend = df_filtered[mask_pend]
             if not df_pend.empty:
                 st.dataframe(
-                    df_pend[cols].sort_values(by='data_criacao', ascending=False),
+                    df_pend[index_cols + data_cols].sort_values(by='data_criacao', ascending=False).set_index(index_cols),
                     use_container_width=True,
-                    hide_index=True,
                     column_config=col_config
                 )
             else:
