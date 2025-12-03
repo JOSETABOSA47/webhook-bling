@@ -11,5 +11,3 @@ Environment Variables (CRÍTICO!)
 dashboard_config.json
 
 Streamlit Cache
-
-.streamlit/

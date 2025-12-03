@@ -8,6 +8,28 @@ from streamlit_autorefresh import st_autorefresh
 from datetime import datetime, timedelta
 from PIL import Image
 
+# # ==========================================
+# # 0. FORÇAR TEMA CLARO E LARANJA (CRÍTICO PARA A TABELA DE BAIXO)
+# # ==========================================
+# # Isso cria o arquivo de configuração automaticamente para obrigar
+# # o Streamlit a desenhar a tabela nativa com fundo branco.
+# if not os.path.exists(".streamlit"):
+#     os.makedirs(".streamlit")
+
+# with open(".streamlit/config.toml", "w") as f:
+#     f.write("""
+# [theme]
+# base="light"
+# primaryColor="#FF6700"
+# backgroundColor="#FFFFFF"
+# secondaryBackgroundColor="#F8F9FA"
+# textColor="#31333F"
+            
+# # --- ADICIONADO: FORÇA A DESABILITAÇÃO DE CACHE DE ASSETS PARA PRODUÇÃO ---
+# [global]
+# disableAssetCache = true
+#     """)
+
 # ==========================================
 # CONFIGURAÇÃO DA LOGO
 LOGO_PATH = 'logo.png' 
@@ -89,7 +111,7 @@ def save_config(minutes):
 
 config = load_config()
 
-# --- 3. Conexão com Banco de Dados (CACHE OTIMIZADO) ----
+# --- 3. Conexão com Banco de Dados (CACHE OTIMIZADO) ---
 @st.cache_resource
 def get_engine():
     # CONFIGURAÇÃO CRÍTICA PARA POSTGRESQL (usando as variáveis .env)
