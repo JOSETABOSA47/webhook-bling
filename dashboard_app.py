@@ -25,6 +25,10 @@ primaryColor="#FF6700"
 backgroundColor="#FFFFFF"
 secondaryBackgroundColor="#F8F9FA"
 textColor="#31333F"
+            
+# --- ADICIONADO: FORÇA A DESABILITAÇÃO DE CACHE DE ASSETS PARA PRODUÇÃO ---
+[global]
+disableAssetCache = true
     """)
 
 # ==========================================
