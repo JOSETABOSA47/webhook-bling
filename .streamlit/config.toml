@@ -9,9 +9,3 @@ textColor="#31333F"
 # --- ADICIONADO: FORÇA A DESABILITAÇÃO DE CACHE DE ASSETS PARA PRODUÇÃO ---
 [global]
 disableAssetCache = true
-
-[server]
-enableStaticServing = true
-
-[browser]
-gatherUsageStats = false   
