@@ -1,0 +1,15 @@
+Python environment
+
+pycache/
+*.pyc
+venv/
+.venv/
+
+Environment Variables (CRÍTICO!)
+
+.env
+dashboard_config.json
+
+Streamlit Cache
+
+.streamlit/
