@@ -209,15 +209,56 @@ def get_api_details_v3(endpoint, entity_id, nome_conta):
 def processar_itens_pedido(conn, pedido_id, data_venda, full_data):
     try:
         cursor = conn.cursor()
-        # Deleção segura dentro da transação
+
+        # Apaga itens antigos
         cursor.execute(f"DELETE FROM {FAT_ITENS_VENDA_TABLE} WHERE pedido_data_id = %s", (pedido_id,))
-        if 'itens' in full_data and full_data['itens']:
-            query_insert = f"INSERT INTO {FAT_ITENS_VENDA_TABLE} (pedido_data_id, codigo, descricao, quantidade, valor_unitario, data_venda) VALUES (%s, %s, %s, %s, %s, %s)"
-            for item in full_data['itens']:
-                cursor.execute(query_insert, (pedido_id, item.get('codigo',''), item.get('descricao',''), item.get('quantidade',0), item.get('valor',0), data_venda))
-        logging.info(f"   -> Itens do pedido {pedido_id} processados.")
+
+        itens = full_data.get('itens', [])
+        if not itens:
+            return
+
+        # 🔵 AGRUPAR ITENS PELO CODIGO E SOMAR QUANTIDADES
+        itens_agrupados = {}
+
+        for item in itens:
+            codigo = item.get('codigo', '')
+            descricao = item.get('descricao', '')
+            quantidade = float(item.get('quantidade', 0))
+            valor_unit = float(item.get('valor', 0))
+
+            if codigo not in itens_agrupados:
+                itens_agrupados[codigo] = {
+                    "codigo": codigo,
+                    "descricao": descricao,
+                    "quantidade": quantidade,
+                    "valor": valor_unit
+                }
+            else:
+                # Soma a quantidade
+                itens_agrupados[codigo]["quantidade"] += quantidade
+
+        # 🔵 INSERIR SOMENTE 1 LINHA POR CODIGO
+        query_insert = f"""
+            INSERT INTO {FAT_ITENS_VENDA_TABLE} 
+            (pedido_data_id, codigo, descricao, quantidade, valor_unitario, data_venda)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """
+
+        for cod, item in itens_agrupados.items():
+            cursor.execute(query_insert, (
+                pedido_id,
+                item["codigo"],
+                item["descricao"],
+                item["quantidade"],
+                item["valor"],
+                data_venda
+            ))
+
+        logging.info(f"   -> Itens consolidados do pedido {pedido_id} processados.")
+
     except Exception as e:
         logging.error(f"Erro itens {pedido_id}: {e}")
+
 
 def atualizar_dashboard(conn, pedido_id, conta_bling, evento, full_data={}, event_date=None):
     val_atualizacao = event_date if event_date else datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -403,6 +444,12 @@ def worker_processamento():
 # Inicia a Thread do Worker
 # Daemon=True significa que se o programa principal fechar, a thread morre junto
 threading.Thread(target=worker_processamento, daemon=True).start()
+
+
+# --- ROTA DE HEALTH CHECK (Para a DigitalOcean) ---
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
 
 # --- 7. Handler Leve (Apenas Recebe) ---
 @app.route('/webhook-bling', methods=['POST'])
