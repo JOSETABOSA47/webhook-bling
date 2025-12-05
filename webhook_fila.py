@@ -37,9 +37,9 @@ db_url = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB
 
 engine = create_engine(
     db_url, 
-    pool_size=5,
-    max_overflow=5,
-    pool_timeout=60, 
+    pool_size=2,
+    max_overflow=1,
+    pool_timeout=30, 
     pool_recycle=1800,
     pool_pre_ping=True 
 )
