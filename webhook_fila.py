@@ -10,7 +10,7 @@ from datetime import datetime
 from sqlalchemy import create_engine
 import queue
 import threading
-import psycopg2 # Adicionado o driver PostgreSQL
+import psycopg2 
 
 # --- 1. Configuração Inicial ---
 load_dotenv()
@@ -22,8 +22,8 @@ DB_HOST = os.environ.get('DB_HOST')
 DB_USER = os.environ.get('DB_USER')
 DB_PASSWORD = os.environ.get('DB_PASSWORD')
 DB_NAME = os.environ.get('DB_NAME')
-DB_PORT = os.environ.get('DB_PORT', 25060) # Porta DigitalOcean
-DB_SCHEMA = os.environ.get('DB_SCHEMA', 'm_db') # Esquema
+DB_PORT = os.environ.get('DB_PORT', 25060) 
+DB_SCHEMA = os.environ.get('DB_SCHEMA', 'm_db') 
 
 # Prefixa tabelas com o esquema
 LOG_TABLE_NAME = f'{DB_SCHEMA}.eventos_bling'
@@ -31,12 +31,10 @@ DASH_TABLE_NAME = f'{DB_SCHEMA}.pedidos'
 CONTAS_TABLE_NAME = f'{DB_SCHEMA}.bling_contas'
 PRODUTOS_TABLE_NAME = f'{DB_SCHEMA}.dim_produtos'
 ESTRUTURA_TABLE_NAME = f'{DB_SCHEMA}.dim_estrutura'
-FAT_ITENS_VENDA_TABLE = f'{DB_SCHEMA}.fat_itens_venda' # Nova referência
+FAT_ITENS_VENDA_TABLE = f'{DB_SCHEMA}.fat_itens_venda' 
 
-# ALTERAÇÃO CRÍTICA: Mudar o driver para PostgreSQL
 db_url = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-# Configuração do Pool Mantida
 engine = create_engine(
     db_url, 
     pool_size=5,
@@ -46,55 +44,55 @@ engine = create_engine(
     pool_pre_ping=True 
 )
 
-# --- 3. SISTEMA DE FILAS E CACHE (A Mágica acontece aqui) ---
+# --- 3. SISTEMA DE FILAS E CACHE ---
 
 # Fila infinita em memória
 processing_queue = queue.Queue()
 
-# Cache simples em memória para evitar ir no banco buscar token toda vez
+# Cache simples em memória
 TOKEN_CACHE = {}
+
+# LOCK PARA EVITAR RENOVAÇÃO DUPLA (A CORREÇÃO PRINCIPAL)
+TOKEN_LOCK = threading.Lock()
 
 def get_db_connection():
     """Obtém conexão do pool."""
     try:
-        # A conexão bruta do psycopg2 é retornada
         return engine.raw_connection()
     except Exception as e:
         logging.error(f"Erro CRÍTICO ao pegar conexão do Pool: {e}")
         return None
 
-# --- 4. Gestão de Tokens Otimizada (Com Cache) ---
+# --- 4. Gestão de Tokens Otimizada (Com Lock e Cache) ---
 def get_bling_token_for_account(nome_conta):
     current_ts = time.time()
     
-    # 1. Tenta pegar do Cache de Memória (Zero Banco de Dados)
-    if nome_conta in TOKEN_CACHE:
-        cached = TOKEN_CACHE[nome_conta]
-        if cached['expires_at'] > (current_ts + 60): # Margem de segurança
-            return cached['token']
+    # 🔴 INICIO DO BLOQUEIO: Só uma thread passa aqui por vez
+    with TOKEN_LOCK:
+        
+        # 1. Tenta pegar do Cache de Memória
+        if nome_conta in TOKEN_CACHE:
+            cached = TOKEN_CACHE[nome_conta]
+            if cached['expires_at'] > (current_ts + 60): 
+                return cached['token']
 
-    # 2. Se não tem no cache, vai no banco (Rapidinho)
-    logging.info(f"[{nome_conta}] Buscando token no banco de dados...")
-    conn = get_db_connection()
-    if not conn: return None
-    
-    # Loop de retry para a renovação (3 tentativas)
-    for tentativa_renovacao in range(1, 4):
+        # 2. Se não tem no cache, vai no banco
+        logging.info(f"[{nome_conta}] Buscando token no banco de dados...")
+        conn = get_db_connection()
+        if not conn: return None
+        
         try:
             with conn.cursor() as cursor:
-                # PostgreSQL usa %s como placeholder
                 sql = f"SELECT client_id, client_secret, access_token, refresh_token, expires_at FROM {CONTAS_TABLE_NAME} WHERE nome_conta = %s"
                 cursor.execute(sql, (nome_conta,))
-                
                 row = cursor.fetchone()
+                
                 if not row:
                     logging.error(f"Conta '{nome_conta}' não encontrada.")
                     return None
 
-                # Mapeia a tupla retornada para um dicionário
                 column_names = [desc[0] for desc in cursor.description]
                 conta_data = dict(zip(column_names, row))
-
                 expires_at = conta_data.get('expires_at') or 0
                 
                 # Se token válido no banco, atualiza cache e retorna
@@ -105,8 +103,8 @@ def get_bling_token_for_account(nome_conta):
                     }
                     return conta_data['access_token']
 
-                # Se expirado, renova
-                logging.info(f"[{nome_conta}] Tentativa {tentativa_renovacao}: Renovando token...")
+                # --- RENOVAÇÃO SEGURA ---
+                logging.info(f"[{nome_conta}] 🔄 Iniciando renovação de token (BLINDADA)...")
                 refresh_token = conta_data.get('refresh_token')
                 auth_str = f"{conta_data['client_id']}:{conta_data['client_secret']}"
                 auth_b64 = base64.b64encode(auth_str.encode()).decode()
@@ -120,11 +118,12 @@ def get_bling_token_for_account(nome_conta):
                 if response.status_code == 200:
                     new_data = response.json()
                     new_access_token = new_data['access_token']
+                    new_refresh_token = new_data['refresh_token'] # PEGA O NOVO REFRESH
                     new_expires_at = int(current_ts + new_data['expires_in'])
 
                     # Atualiza no banco
                     update_sql = f"UPDATE {CONTAS_TABLE_NAME} SET access_token = %s, refresh_token = %s, expires_at = %s WHERE nome_conta = %s"
-                    cursor.execute(update_sql, (new_access_token, new_data['refresh_token'], new_expires_at, nome_conta))
+                    cursor.execute(update_sql, (new_access_token, new_refresh_token, new_expires_at, nome_conta))
                     conn.commit()
                     
                     # Atualiza Cache
@@ -132,34 +131,36 @@ def get_bling_token_for_account(nome_conta):
                         'token': new_access_token,
                         'expires_at': new_expires_at
                     }
+                    logging.info(f"[{nome_conta}] ✅ Token renovado com sucesso!")
                     return new_access_token
                 
                 elif response.status_code in [400, 401]:
-                    # Erro de credencial (refresh token inválido, client id/secret errado)
-                    logging.error(f"[{nome_conta}] Erro FATAL (400/401) na Renovação. Refresh token INVÁLIDO ou Credenciais incorretas.")
-                    return None # Sai do loop e da função sem tentar novamente
+                    logging.error(f"[{nome_conta}] ❌ ERRO FATAL: Refresh token expirado/inválido. Precisa reautenticar manualmente.")
+                    # Remove do cache para garantir que não use lixo
+                    if nome_conta in TOKEN_CACHE: del TOKEN_CACHE[nome_conta]
+                    return None
                 
                 else:
-                    logging.warning(f"[{nome_conta}] Erro Renovação API: {response.status_code}. Tentando novamente em 5s...")
-                    time.sleep(5)
-                    continue # Volta para a próxima tentativa do loop for
-                    
+                    logging.error(f"[{nome_conta}] Erro API Bling: {response.status_code}")
+                    return None
+
         except Exception as e:
             logging.error(f"Erro Token ({nome_conta}): {e}")
-            time.sleep(5) # Espera por erros de conexão DB/API
-            continue
+            return None
         finally:
             if conn: conn.close()
-            
-    logging.error(f"[{nome_conta}] Falha persistente na renovação após 3 tentativas.")
-    return None
 
 # --- 5. API Call (SEM CONEXÃO DE BANCO ABERTA) ---
 def get_api_details_v3(endpoint, entity_id, nome_conta):
     # Pega o token (pode usar o banco rapidinho, mas fecha logo em seguida)
-    token = get_bling_token_for_account(nome_conta)
+    try:
+        token = get_bling_token_for_account(nome_conta)
+    except Exception as e:
+        logging.error(f"Erro ao pegar token: {e}")
+        token = None
+
     if not token:
-        # Este é o ponto onde o Worker falha e entra no loop.
+        # Se falhou o token, lançamos erro para o worker tentar depois ou logar
         raise Exception(f"Falha auth {nome_conta}")
 
     url = f"https://api.bling.com.br/Api/v3/{endpoint}/{entity_id}"
@@ -176,7 +177,7 @@ def get_api_details_v3(endpoint, entity_id, nome_conta):
                 return response.json().get('data', {})
             elif response.status_code == 429:
                 tempo_espera = 3 + (tentativa * 2)
-                logging.warning(f"⏳ Limite API (429). Tentativa {tentativa}. Dormindo {tempo_espera}s (sem travar banco)...")
+                logging.warning(f"⏳ Limite API (429). Tentativa {tentativa}. Dormindo {tempo_espera}s...")
                 time.sleep(tempo_espera)
                 continue
             elif response.status_code >= 500:
@@ -187,14 +188,19 @@ def get_api_details_v3(endpoint, entity_id, nome_conta):
             elif response.status_code == 401:
                 # Se a API nega (401), limpamos o cache para forçar a renovação.
                 logging.warning(f"⚠️ API retornou 401 para ID {entity_id}. Limpando cache para renovação...")
-                if nome_conta in TOKEN_CACHE:
-                    del TOKEN_CACHE[nome_conta]
-                time.sleep(5)
-                # Pula para a próxima tentativa do loop, que chamará get_bling_token_for_account novamente
-                continue
+                with TOKEN_LOCK: # Protege a limpeza do cache também
+                    if nome_conta in TOKEN_CACHE:
+                        del TOKEN_CACHE[nome_conta]
+                time.sleep(2)
+                # Tenta pegar token novo imediatamente
+                new_token = get_bling_token_for_account(nome_conta)
+                if new_token:
+                    headers['Authorization'] = f'Bearer {new_token}'
+                    continue
+                else:
+                    raise Exception("Falha ao renovar token após 401")
             else:
                 logging.error(f"Erro API Fatal: {response.status_code}")
-                # Erros não tratados devem falhar para serem reprocessados pelo Worker
                 raise Exception(f"Erro API: {response.status_code}")
                 
         except requests.exceptions.RequestException:
@@ -442,9 +448,7 @@ def worker_processamento():
             processing_queue.task_done()
 
 # Inicia a Thread do Worker
-# Daemon=True significa que se o programa principal fechar, a thread morre junto
 threading.Thread(target=worker_processamento, daemon=True).start()
-
 
 # --- ROTA DE HEALTH CHECK (Para a DigitalOcean) ---
 @app.route('/health', methods=['GET'])
@@ -453,10 +457,8 @@ def health_check():
 
 # --- 7. Handler Leve (Apenas Recebe) ---
 @app.route('/webhook-bling', methods=['POST'])
-@app.route('/', methods=['POST']) # <--- ADICIONADO ROTA DE FALLBACK PARA A RAIZ
+@app.route('/', methods=['POST'])
 def handle_bling_webhook():
-    # Tenta pegar a conta do parâmetro de consulta. 
-    # Tenta pegar tanto de /?conta=x quanto de /webhook-bling?conta=x
     conta_bling = request.args.get('conta')
     
     if not conta_bling:
@@ -477,20 +479,18 @@ def handle_bling_webhook():
         return jsonify({"message": "ID nao encontrado"}), 200
 
     # --- ENFILEIRAMENTO ---
-    # Cria o objeto da tarefa e joga na fila
     task = {
         'entity_id': entity_id,
         'conta_bling': conta_bling,
         'event_type': event_type,
         'payload_date': payload.get('date'),
-        'raw_data': data_obj # Passa dados crus caso precise (ex: estoque simples)
+        'raw_data': data_obj 
     }
     
     processing_queue.put(task)
     
     logging.info(f"📥 Webhook Recebido e Enfileirado: {event_type} - {entity_id} (Fila: {processing_queue.qsize()})")
 
-    # Responde pro Bling IMEDIATAMENTE. O Bling fica feliz e não manda retry.
     return jsonify({"status": "queued"}), 200
 
 if __name__ == '__main__':
