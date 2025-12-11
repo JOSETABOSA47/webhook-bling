@@ -103,7 +103,7 @@ def get_bling_token_for_account(nome_conta):
                     }
                     return conta_data['access_token']
 
-                # --- RENOVAÇÃO SEGURA ---
+                # --- RENOVAÇÃO SEGURA (CORREÇÃO APLICADA AQUI) ---
                 logging.info(f"[{nome_conta}] 🔄 Iniciando renovação de token (BLINDADA)...")
                 refresh_token = conta_data.get('refresh_token')
                 auth_str = f"{conta_data['client_id']}:{conta_data['client_secret']}"
@@ -113,36 +113,46 @@ def get_bling_token_for_account(nome_conta):
                 headers = {'Authorization': f'Basic {auth_b64}', 'Content-Type': 'application/x-www-form-urlencoded'}
                 payload = {'grant_type': 'refresh_token', 'refresh_token': refresh_token}
 
-                response = requests.post(url, headers=headers, data=payload)
-                
-                if response.status_code == 200:
-                    new_data = response.json()
-                    new_access_token = new_data['access_token']
-                    new_refresh_token = new_data['refresh_token'] # PEGA O NOVO REFRESH
-                    new_expires_at = int(current_ts + new_data['expires_in'])
-
-                    # Atualiza no banco
-                    update_sql = f"UPDATE {CONTAS_TABLE_NAME} SET access_token = %s, refresh_token = %s, expires_at = %s WHERE nome_conta = %s"
-                    cursor.execute(update_sql, (new_access_token, new_refresh_token, new_expires_at, nome_conta))
-                    conn.commit()
+                # LOOP DE TENTATIVAS ESPECÍFICO PARA A RENOVAÇÃO
+                max_retries_token = 3
+                for attempt in range(max_retries_token):
+                    response = requests.post(url, headers=headers, data=payload)
                     
-                    # Atualiza Cache
-                    TOKEN_CACHE[nome_conta] = {
-                        'token': new_access_token,
-                        'expires_at': new_expires_at
-                    }
-                    logging.info(f"[{nome_conta}] ✅ Token renovado com sucesso!")
-                    return new_access_token
+                    if response.status_code == 429:
+                        logging.warning(f"⏳ [{nome_conta}] 429 Too Many Requests na RENOVAÇÃO DO TOKEN. Dormindo 60s...")
+                        time.sleep(60) # Dorme 1 minuto inteiro antes de tentar de novo
+                        continue # Tenta de novo o POST
+
+                    elif response.status_code == 200:
+                        new_data = response.json()
+                        new_access_token = new_data['access_token']
+                        new_refresh_token = new_data['refresh_token']
+                        new_expires_at = int(current_ts + new_data['expires_in'])
+
+                        # Atualiza no banco
+                        update_sql = f"UPDATE {CONTAS_TABLE_NAME} SET access_token = %s, refresh_token = %s, expires_at = %s WHERE nome_conta = %s"
+                        cursor.execute(update_sql, (new_access_token, new_refresh_token, new_expires_at, nome_conta))
+                        conn.commit()
+                        
+                        # Atualiza Cache
+                        TOKEN_CACHE[nome_conta] = {
+                            'token': new_access_token,
+                            'expires_at': new_expires_at
+                        }
+                        logging.info(f"[{nome_conta}] ✅ Token renovado com sucesso!")
+                        return new_access_token
+                    
+                    elif response.status_code in [400, 401]:
+                        logging.error(f"[{nome_conta}] ❌ ERRO FATAL: Refresh token expirado/inválido. Precisa reautenticar manualmente.")
+                        if nome_conta in TOKEN_CACHE: del TOKEN_CACHE[nome_conta]
+                        return None
+                    
+                    else:
+                        logging.error(f"[{nome_conta}] Erro API Bling Token: {response.status_code}")
+                        return None
                 
-                elif response.status_code in [400, 401]:
-                    logging.error(f"[{nome_conta}] ❌ ERRO FATAL: Refresh token expirado/inválido. Precisa reautenticar manualmente.")
-                    # Remove do cache para garantir que não use lixo
-                    if nome_conta in TOKEN_CACHE: del TOKEN_CACHE[nome_conta]
-                    return None
-                
-                else:
-                    logging.error(f"[{nome_conta}] Erro API Bling: {response.status_code}")
-                    return None
+                logging.error(f"[{nome_conta}] Falha na renovação após {max_retries_token} tentativas.")
+                return None
 
         except Exception as e:
             logging.error(f"Erro Token ({nome_conta}): {e}")
@@ -175,11 +185,13 @@ def get_api_details_v3(endpoint, entity_id, nome_conta):
             
             if response.status_code == 200:
                 return response.json().get('data', {})
+            
+            # --- CORREÇÃO AQUI: AUMENTADO TEMPO DE ESPERA PARA 429 ---
             elif response.status_code == 429:
-                tempo_espera = 3 + (tentativa * 2)
-                logging.warning(f"⏳ Limite API (429). Tentativa {tentativa}. Dormindo {tempo_espera}s...")
-                time.sleep(tempo_espera)
+                logging.warning(f"⏳ [{nome_conta}] Limite API (429) no endpoint {endpoint}. Tentativa {tentativa}. Dormindo 60s...")
+                time.sleep(60) # Pausa agressiva de 60 segundos
                 continue
+            
             elif response.status_code >= 500:
                 time.sleep(5)
                 continue

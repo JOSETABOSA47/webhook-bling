@@ -9,5 +9,7 @@ Environment Variables (CRÍTICO!)
 
 .env
 dashboard_config.json
+dashboard_app.py
+logo.png
 
 Streamlit Cache
