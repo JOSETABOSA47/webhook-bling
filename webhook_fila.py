@@ -595,18 +595,24 @@ def sync_orders_route():
             "message": "Parâmetros 'conta', 'data_inicial' e 'data_final' são obrigatórios. Use YYYY-MM-DD."
         }), 400
         
+    def run_sync_in_background(c, di, df):
+        try:
+            logging.info(f"🔄 [Background Sync] Iniciando sincronização manual de pedidos para {c} de {di} até {df}...")
+            total = sync_orders_for_date_range(c, di, df)
+            logging.info(f"✅ [Background Sync] Sincronização concluída com sucesso! Total enfileirados: {total}")
+        except Exception as err:
+            logging.error(f"❌ [Background Sync] Erro na sincronização de {c}: {err}")
+
     try:
-        # Roda a listagem síncrona de páginas e enfileira no Worker em background
-        logging.info(f"🔄 Iniciando sincronização manual de pedidos para {conta} de {data_inicial} até {data_final}...")
-        total = sync_orders_for_date_range(conta, data_inicial, data_final)
+        # Inicia a sincronização em uma thread separada para evitar timeout HTTP do Gunicorn
+        threading.Thread(target=run_sync_in_background, args=(conta, data_inicial, data_final), daemon=True).start()
         
         return jsonify({
             "status": "success",
-            "message": f"Sincronização iniciada com sucesso. {total} pedidos enfileirados para processamento em segundo plano.",
-            "enqueued_count": total
+            "message": f"Sincronização de pedidos iniciada em segundo plano para a conta {conta} de {data_inicial} até {data_final}. Acompanhe o processamento nos logs da DigitalOcean."
         }), 200
     except Exception as e:
-        logging.error(f"Erro na rota de sincronização: {e}")
+        logging.error(f"Erro ao iniciar a thread de sincronização: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # --- 7. Handler Leve (Apenas Recebe) ---
