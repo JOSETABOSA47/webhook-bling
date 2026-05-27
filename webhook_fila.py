@@ -583,7 +583,7 @@ def sync_orders_for_date_range(conta_bling, data_inicial, data_final):
             
     return total_enfileirados
 
-@app.route('/sync-orders', methods=['GET'])
+@app.route('/sync-orders', methods=['GET', 'POST'])
 def sync_orders_route():
     conta = request.args.get('conta')
     data_inicial = request.args.get('data_inicial')
