@@ -7,6 +7,7 @@ import base64
 import time
 import json
 from datetime import datetime
+# pyrefly: ignore [missing-import]
 from sqlalchemy import create_engine
 import queue
 import threading
@@ -54,6 +55,31 @@ TOKEN_CACHE = {}
 
 # LOCK PARA EVITAR RENOVAÇÃO DUPLA (A CORREÇÃO PRINCIPAL)
 TOKEN_LOCK = threading.Lock()
+
+# Novos objetos de controle de fila e desduplicação
+QUEUE_LOCK = threading.Lock()
+PENDING_TASKS = set()
+
+# Estruturas para Controle de Throttling por conta
+THROTTLE_LOCK = threading.Lock()
+LAST_REQUEST_TIME = {}
+MIN_REQUEST_INTERVAL = 0.4  # segundos (máximo ~2.5 req/s)
+
+def apply_throttling(nome_conta):
+    """Garante que haja um intervalo mínimo entre requisições para a mesma conta."""
+    sleep_time = 0
+    with THROTTLE_LOCK:
+        now = time.time()
+        last_time = LAST_REQUEST_TIME.get(nome_conta, 0)
+        elapsed = now - last_time
+        if elapsed < MIN_REQUEST_INTERVAL:
+            sleep_time = MIN_REQUEST_INTERVAL - elapsed
+            
+    if sleep_time > 0:
+        time.sleep(sleep_time)
+        
+    with THROTTLE_LOCK:
+        LAST_REQUEST_TIME[nome_conta] = time.time()
 
 def get_db_connection():
     """Obtém conexão do pool."""
@@ -116,11 +142,13 @@ def get_bling_token_for_account(nome_conta):
                 # LOOP DE TENTATIVAS ESPECÍFICO PARA A RENOVAÇÃO
                 max_retries_token = 3
                 for attempt in range(max_retries_token):
+                    apply_throttling(nome_conta)
                     response = requests.post(url, headers=headers, data=payload)
                     
                     if response.status_code == 429:
-                        logging.warning(f"⏳ [{nome_conta}] 429 Too Many Requests na RENOVAÇÃO DO TOKEN. Dormindo 60s...")
-                        time.sleep(60) # Dorme 1 minuto inteiro antes de tentar de novo
+                        backoff = 2 ** (attempt + 1)
+                        logging.warning(f"⏳ [{nome_conta}] 429 Too Many Requests na RENOVAÇÃO DO TOKEN. Dormindo {backoff}s...")
+                        time.sleep(backoff)
                         continue # Tenta de novo o POST
 
                     elif response.status_code == 200:
@@ -177,19 +205,23 @@ def get_api_details_v3(endpoint, entity_id, nome_conta):
     headers = {'Authorization': f'Bearer {token}'}
     
     tentativa = 1
-    max_tentativas = 20 
+    max_tentativas = 5 
     
     while tentativa <= max_tentativas:
         try:
+            # Aplica throttling proativo
+            apply_throttling(nome_conta)
+            
             response = requests.get(url, headers=headers)
             
             if response.status_code == 200:
                 return response.json().get('data', {})
             
-            # --- CORREÇÃO AQUI: AUMENTADO TEMPO DE ESPERA PARA 429 ---
             elif response.status_code == 429:
-                logging.warning(f"⏳ [{nome_conta}] Limite API (429) no endpoint {endpoint}. Tentativa {tentativa}. Dormindo 60s...")
-                time.sleep(60) # Pausa agressiva de 60 segundos
+                backoff_time = 2 ** tentativa
+                backoff_time = min(backoff_time, 30)
+                logging.warning(f"⏳ [{nome_conta}] Limite API (429) no endpoint {endpoint}. Tentativa {tentativa}. Dormindo {backoff_time}s...")
+                time.sleep(backoff_time)
                 continue
             
             elif response.status_code >= 500:
@@ -410,6 +442,12 @@ def worker_processamento():
             event_type = task['event_type']
             payload_date = task['payload_date']
             
+            # Desduplicação: Remove da lista de tarefas pendentes
+            category = 'order' if event_type.startswith('order.') else 'product'
+            queue_key = (conta_bling, category, entity_id)
+            with QUEUE_LOCK:
+                PENDING_TASKS.discard(queue_key)
+            
             logging.info(f"⚙️ Processando Fila: {event_type} - {entity_id}")
 
             # 1. Busca API (Lento, mas SEM BANCO)
@@ -467,6 +505,110 @@ threading.Thread(target=worker_processamento, daemon=True).start()
 def health_check():
     return jsonify({"status": "healthy"}), 200
 
+# --- FUNÇÃO E ROTA DE SINCRONIZAÇÃO HISTÓRICA ---
+def sync_orders_for_date_range(conta_bling, data_inicial, data_final):
+    # Pega o token
+    token = get_bling_token_for_account(conta_bling)
+    if not token:
+        raise Exception(f"Falha ao obter token para {conta_bling}")
+
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/json'
+    }
+    
+    pagina = 1
+    total_enfileirados = 0
+    
+    while True:
+        url = "https://api.bling.com.br/Api/v3/pedidos/vendas"
+        params = {
+            'pagina': pagina,
+            'limite': 100,
+            'dataInicial': data_inicial,
+            'dataFinal': data_final
+        }
+        
+        # Aplica throttling proativo
+        apply_throttling(conta_bling)
+        
+        logging.info(f"[{conta_bling}] Sincronizando página {pagina} de pedidos de vendas...")
+        try:
+            response = requests.get(url, headers=headers, params=params)
+        except Exception as e:
+            logging.error(f"Erro na requisição de listagem: {e}")
+            break
+            
+        if response.status_code == 429:
+            logging.warning(f"⏳ [{conta_bling}] 429 Too Many Requests na listagem. Dormindo 5s...")
+            time.sleep(5)
+            continue
+            
+        if response.status_code != 200:
+            logging.error(f"[{conta_bling}] Erro ao listar pedidos na pág {pagina}: {response.status_code}")
+            break
+            
+        res_json = response.json()
+        orders = res_json.get('data', [])
+        
+        if not orders:
+            break  # Fim da paginação
+            
+        for order in orders:
+            order_id = order.get('id')
+            if not order_id:
+                continue
+                
+            task = {
+                'entity_id': order_id,
+                'conta_bling': conta_bling,
+                'event_type': 'order.updated',
+                'payload_date': order.get('data'),
+                'raw_data': order
+            }
+            
+            category = 'order'
+            queue_key = (conta_bling, category, order_id)
+            
+            with QUEUE_LOCK:
+                if queue_key not in PENDING_TASKS:
+                    PENDING_TASKS.add(queue_key)
+                    processing_queue.put(task)
+                    total_enfileirados += 1
+                    
+        pagina += 1
+        
+        if len(orders) < 100:
+            break
+            
+    return total_enfileirados
+
+@app.route('/sync-orders', methods=['GET'])
+def sync_orders_route():
+    conta = request.args.get('conta')
+    data_inicial = request.args.get('data_inicial')
+    data_final = request.args.get('data_final')
+    
+    if not conta or not data_inicial or not data_final:
+        return jsonify({
+            "status": "error", 
+            "message": "Parâmetros 'conta', 'data_inicial' e 'data_final' são obrigatórios. Use YYYY-MM-DD."
+        }), 400
+        
+    try:
+        # Roda a listagem síncrona de páginas e enfileira no Worker em background
+        logging.info(f"🔄 Iniciando sincronização manual de pedidos para {conta} de {data_inicial} até {data_final}...")
+        total = sync_orders_for_date_range(conta, data_inicial, data_final)
+        
+        return jsonify({
+            "status": "success",
+            "message": f"Sincronização iniciada com sucesso. {total} pedidos enfileirados para processamento em segundo plano.",
+            "enqueued_count": total
+        }), 200
+    except Exception as e:
+        logging.error(f"Erro na rota de sincronização: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # --- 7. Handler Leve (Apenas Recebe) ---
 @app.route('/webhook-bling', methods=['POST'])
 @app.route('/', methods=['POST'])
@@ -489,6 +631,16 @@ def handle_bling_webhook():
     
     if not entity_id:
         return jsonify({"message": "ID nao encontrado"}), 200
+
+    # --- DESDUPLICAÇÃO EM TEMPO REAL ---
+    category = 'order' if event_type.startswith('order.') else 'product'
+    queue_key = (conta_bling, category, entity_id)
+
+    with QUEUE_LOCK:
+        if queue_key in PENDING_TASKS:
+            logging.info(f"⏭️ Webhook Duplicado Ignorado (Já na Fila): {event_type} - {entity_id}")
+            return jsonify({"status": "skipped", "reason": "already_queued"}), 200
+        PENDING_TASKS.add(queue_key)
 
     # --- ENFILEIRAMENTO ---
     task = {
