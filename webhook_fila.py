@@ -33,6 +33,7 @@ CONTAS_TABLE_NAME = f'{DB_SCHEMA}.bling_contas'
 PRODUTOS_TABLE_NAME = f'{DB_SCHEMA}.dim_produtos'
 ESTRUTURA_TABLE_NAME = f'{DB_SCHEMA}.dim_estrutura'
 FAT_ITENS_VENDA_TABLE = f'{DB_SCHEMA}.fat_itens_venda' 
+FILA_TABLE_NAME = f'{DB_SCHEMA}.fila_webhooks' 
 
 db_url = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
@@ -90,14 +91,14 @@ def get_db_connection():
         return None
 
 # --- 4. Gestão de Tokens Otimizada (Com Lock e Cache) ---
-def get_bling_token_for_account(nome_conta):
+def get_bling_token_for_account(nome_conta, force_refresh=False):
     current_ts = time.time()
     
     # 🔴 INICIO DO BLOQUEIO: Só uma thread passa aqui por vez
     with TOKEN_LOCK:
         
         # 1. Tenta pegar do Cache de Memória
-        if nome_conta in TOKEN_CACHE:
+        if not force_refresh and nome_conta in TOKEN_CACHE:
             cached = TOKEN_CACHE[nome_conta]
             if cached['expires_at'] > (current_ts + 60): 
                 return cached['token']
@@ -121,8 +122,8 @@ def get_bling_token_for_account(nome_conta):
                 conta_data = dict(zip(column_names, row))
                 expires_at = conta_data.get('expires_at') or 0
                 
-                # Se token válido no banco, atualiza cache e retorna
-                if conta_data['access_token'] and expires_at > (current_ts + 60):
+                # Se token válido no banco e não for forçado, atualiza cache e retorna
+                if not force_refresh and conta_data['access_token'] and expires_at > (current_ts + 60):
                     TOKEN_CACHE[nome_conta] = {
                         'token': conta_data['access_token'],
                         'expires_at': expires_at
@@ -136,7 +137,11 @@ def get_bling_token_for_account(nome_conta):
                 auth_b64 = base64.b64encode(auth_str.encode()).decode()
                 
                 url = "https://www.bling.com.br/Api/v3/oauth/token"
-                headers = {'Authorization': f'Basic {auth_b64}', 'Content-Type': 'application/x-www-form-urlencoded'}
+                headers = {
+                    'Authorization': f'Basic {auth_b64}',
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'enable-jwt': '1'
+                }
                 payload = {'grant_type': 'refresh_token', 'refresh_token': refresh_token}
 
                 # LOOP DE TENTATIVAS ESPECÍFICO PARA A RENOVAÇÃO
@@ -201,8 +206,18 @@ def get_api_details_v3(endpoint, entity_id, nome_conta):
         # Se falhou o token, lançamos erro para o worker tentar depois ou logar
         raise Exception(f"Falha auth {nome_conta}")
 
+    # Se o token ainda for o antigo opaco (< 100 caracteres), migra automaticamente para JWT
+    if len(token) < 100:
+        logging.info(f"[{nome_conta}] 🔄 Token legado opaco detectado. Migrando automaticamente para JWT...")
+        token = get_bling_token_for_account(nome_conta, force_refresh=True)
+        if not token:
+            raise Exception(f"Falha ao migrar token para JWT {nome_conta}")
+
     url = f"https://api.bling.com.br/Api/v3/{endpoint}/{entity_id}"
-    headers = {'Authorization': f'Bearer {token}'}
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'enable-jwt': '1'
+    }
     
     tentativa = 1
     max_tentativas = 5 
@@ -237,7 +252,7 @@ def get_api_details_v3(endpoint, entity_id, nome_conta):
                         del TOKEN_CACHE[nome_conta]
                 time.sleep(2)
                 # Tenta pegar token novo imediatamente
-                new_token = get_bling_token_for_account(nome_conta)
+                new_token = get_bling_token_for_account(nome_conta, force_refresh=True)
                 if new_token:
                     headers['Authorization'] = f'Bearer {new_token}'
                     continue
@@ -427,36 +442,53 @@ def processar_produto_completo(conn, full_data, nome_conta):
 def worker_processamento():
     """
     Esta função roda em segundo plano.
-    Ela processa UM item por vez (ou conforme sua lógica), garantindo que
-    o banco nunca fique sobrecarregado, mesmo se chegarem 1000 webhooks.
+    Ela processa UM item por vez de forma persistente a partir da tabela
+    fila_webhooks no PostgreSQL, garantindo que mesmo se o servidor for
+    reiniciado, nenhuma notificação de webhook seja perdida.
     """
-    logging.info("🚀 Worker de processamento INICIADO.")
+    logging.info("🚀 Worker de processamento com Fila Persistente INICIADO.")
+    
+    # 1. Recupera tarefas que estavam no meio do processamento antes de uma queda/redeploy
+    reset_stuck_tasks()
     
     while True:
-        # Pega item da fila (bloqueia se estiver vazia até chegar algo)
-        task = processing_queue.get() 
+        task = None
+        from_memory = False
+        
+        # Prioridade 1: Esvazia itens de fallback da memória se houver
+        try:
+            task = processing_queue.get_nowait()
+            from_memory = True
+        except queue.Empty:
+            pass
+            
+        # Prioridade 2: Busca próximo item pendente no banco com bloqueio seguro
+        if not task:
+            task = get_next_task_from_db()
+            
+        if not task:
+            # Fila vazia, dorme 1 segundo para não sobrecarregar CPU/Banco
+            time.sleep(1)
+            continue
+            
+        task_id = task.get('id') # None quando veio da memória
+        entity_id = task['entity_id']
+        conta_bling = task['conta_bling']
+        event_type = task['event_type']
+        payload_date = task.get('payload_date')
+        tentativas = task.get('tentativas', 0)
+        
+        logging.info(f"⚙️ Processando Fila (ID {task_id or 'RAM'}): {event_type} - {entity_id} ({conta_bling})")
+        
+        success = False
+        error_msg = None
         
         try:
-            entity_id = task['entity_id']
-            conta_bling = task['conta_bling']
-            event_type = task['event_type']
-            payload_date = task['payload_date']
-            
-            # Desduplicação: Remove da lista de tarefas pendentes
-            category = 'order' if event_type.startswith('order.') else 'product'
-            queue_key = (conta_bling, category, entity_id)
-            with QUEUE_LOCK:
-                PENDING_TASKS.discard(queue_key)
-            
-            logging.info(f"⚙️ Processando Fila: {event_type} - {entity_id}")
-
-            # 1. Busca API (Lento, mas SEM BANCO)
+            # 1. Busca API Bling (Stateless / Sem segurar conexão do banco aberta)
             full_data = {}
             if event_type.startswith('order.'):
                 full_data = get_api_details_v3('pedidos/vendas', entity_id, conta_bling)
-            elif event_type.startswith('product.'):
-                full_data = get_api_details_v3('produtos', entity_id, conta_bling)
-            elif event_type == 'stock.updated':
+            elif event_type.startswith('product.') or event_type == 'stock.updated':
                 full_data = get_api_details_v3('produtos', entity_id, conta_bling)
 
             # 2. Salva no Banco (Rápido, abre e fecha)
@@ -466,9 +498,8 @@ def worker_processamento():
                     if event_type.startswith('order.'):
                         atualizar_dashboard(conn, entity_id, conta_bling, event_type, full_data, payload_date)
                     elif event_type.startswith('product.') or event_type == 'stock.updated':
-                        # Apenas salva se os dados foram encontrados (404 é tratado na API)
                         if full_data: 
-                           processar_produto_completo(conn, full_data, conta_bling)
+                            processar_produto_completo(conn, full_data, conta_bling)
                     
                     # Salva log de evento
                     with conn.cursor() as cursor:
@@ -479,31 +510,150 @@ def worker_processamento():
                         """, (f"{event_type}-{entity_id}", entity_id, event_type, conta_bling, json.dumps(task),))
                     
                     conn.commit()
+                    success = True
                     logging.info(f"✅ Sucesso Fila: {entity_id}")
                 except Exception as e:
                     conn.rollback()
+                    error_msg = f"Erro SQL: {e}"
                     logging.error(f"❌ Erro SQL no Worker ({entity_id}): {e}")
-                    # Reenfileirar o item se houver erro SQL para nova tentativa
-                    processing_queue.put(task) 
                 finally:
-                    if conn: conn.close() # DEVOLVE A CONEXÃO PRO POOL IMEDIATAMENTE
+                    conn.close()
             else:
-                logging.error("❌ Worker não conseguiu conexão com DB. Reenfileirando...")
-                processing_queue.put(task)
+                error_msg = "Sem conexão DB"
+                logging.error("❌ Worker não conseguiu conexão com DB.")
         
         except Exception as e:
-            logging.error(f"❌ Erro Genérico no Worker: {e}")
+            error_msg = f"Erro processamento: {e}"
+            logging.error(f"❌ Erro Genérico no Worker ({entity_id}): {e}")
         
         finally:
-            processing_queue.task_done()
+            if task_id:
+                update_task_status(task_id, success, error_msg, tentativas)
+            elif not success:
+                # Reenfileira na memória se foi fallback e falhou
+                processing_queue.put(task)
+                
+            if from_memory:
+                processing_queue.task_done()
+
+def reset_stuck_tasks():
+    """Recupera tarefas que ficaram com status 'processando' após um crash ou reinício repentino."""
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE {FILA_TABLE_NAME} SET status = 'pendente', updated_at = NOW() WHERE status = 'processando'")
+            conn.commit()
+            logging.info("🔄 Verificação de integridade: Tarefas interrompidas recuperadas para 'pendente'.")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Erro ao recuperar tarefas no startup: {e}")
+        finally:
+            conn.close()
+
+def get_next_task_from_db():
+    """Busca a próxima tarefa pendente do banco usando FOR UPDATE SKIP LOCKED para segurança concorrente."""
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT id, conta_bling, event_type, entity_id, payload_date, raw_data, tentativas
+                FROM {FILA_TABLE_NAME}
+                WHERE status = 'pendente'
+                ORDER BY id ASC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            """)
+            row = cur.fetchone()
+            if not row:
+                return None
+            
+            task_id, conta_bling, event_type, entity_id, payload_date, raw_data, tentativas = row
+            cur.execute(f"UPDATE {FILA_TABLE_NAME} SET status = 'processando', updated_at = NOW() WHERE id = %s", (task_id,))
+            conn.commit()
+            return {
+                'id': task_id,
+                'conta_bling': conta_bling,
+                'event_type': event_type,
+                'entity_id': entity_id,
+                'payload_date': payload_date,
+                'raw_data': raw_data,
+                'tentativas': tentativas
+            }
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Erro ao buscar tarefa no banco: {e}")
+        return None
+    finally:
+        conn.close()
+
+def update_task_status(task_id, success, error_msg=None, tentativas=0):
+    """Atualiza o status final da tarefa na fila persistente."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            if success:
+                cur.execute(f"""
+                    UPDATE {FILA_TABLE_NAME}
+                    SET status = 'concluido', processed_at = NOW(), updated_at = NOW()
+                    WHERE id = %s
+                """, (task_id,))
+            else:
+                # Se falhou e atingiu 5 tentativas, marca como 'erro', senão volta para 'pendente'
+                new_status = 'erro' if tentativas >= 4 else 'pendente'
+                cur.execute(f"""
+                    UPDATE {FILA_TABLE_NAME}
+                    SET status = %s, tentativas = tentativas + 1, ultimo_erro = %s, updated_at = NOW()
+                    WHERE id = %s
+                """, (new_status, str(error_msg)[:500] if error_msg else None, task_id))
+            conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"Erro ao atualizar status da tarefa #{task_id}: {e}")
+    finally:
+        conn.close()
 
 # Inicia a Thread do Worker
 threading.Thread(target=worker_processamento, daemon=True).start()
 
-# --- ROTA DE HEALTH CHECK (Para a DigitalOcean) ---
+# --- ROTA DE HEALTH CHECK (Com Estatísticas da Fila) ---
 @app.route('/health', methods=['GET'])
 def health_check():
-    return jsonify({"status": "healthy"}), 200
+    pendentes = 0
+    processando = 0
+    erros = 0
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"""
+                    SELECT status, count(*) 
+                    FROM {FILA_TABLE_NAME} 
+                    WHERE status IN ('pendente', 'processando', 'erro') 
+                    GROUP BY status
+                """)
+                for row in cur.fetchall():
+                    if row[0] == 'pendente': pendentes = row[1]
+                    elif row[0] == 'processando': processando = row[1]
+                    elif row[0] == 'erro': erros = row[1]
+        except:
+            pass
+        finally:
+            conn.close()
+            
+    return jsonify({
+        "status": "healthy",
+        "fila_banco": {
+            "pendente": pendentes,
+            "processando": processando,
+            "erro": erros
+        },
+        "fila_memoria_fallback": processing_queue.qsize()
+    }), 200
 
 # --- FUNÇÃO E ROTA DE SINCRONIZAÇÃO HISTÓRICA ---
 def sync_orders_for_date_range(conta_bling, data_inicial, data_final):
@@ -514,7 +664,8 @@ def sync_orders_for_date_range(conta_bling, data_inicial, data_final):
 
     headers = {
         'Authorization': f'Bearer {token}',
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        'enable-jwt': '1'
     }
     
     pagina = 1
@@ -554,27 +705,27 @@ def sync_orders_for_date_range(conta_bling, data_inicial, data_final):
         if not orders:
             break  # Fim da paginação
             
-        for order in orders:
-            order_id = order.get('id')
-            if not order_id:
-                continue
-                
-            task = {
-                'entity_id': order_id,
-                'conta_bling': conta_bling,
-                'event_type': 'order.updated',
-                'payload_date': order.get('data'),
-                'raw_data': order
-            }
-            
-            category = 'order'
-            queue_key = (conta_bling, category, order_id)
-            
-            with QUEUE_LOCK:
-                if queue_key not in PENDING_TASKS:
-                    PENDING_TASKS.add(queue_key)
-                    processing_queue.put(task)
-                    total_enfileirados += 1
+        conn_sync = get_db_connection()
+        if conn_sync:
+            try:
+                with conn_sync.cursor() as cur_sync:
+                    for order in orders:
+                        order_id = order.get('id')
+                        if not order_id:
+                            continue
+                        cur_sync.execute(f"""
+                            INSERT INTO {FILA_TABLE_NAME} (conta_bling, event_type, entity_id, payload_date, raw_data, status)
+                            VALUES (%s, 'order.updated', %s, %s, %s, 'pendente')
+                            ON CONFLICT (conta_bling, event_type, entity_id) WHERE status IN ('pendente', 'processando')
+                            DO NOTHING
+                        """, (conta_bling, order_id, order.get('data'), json.dumps(order)))
+                        total_enfileirados += 1
+                    conn_sync.commit()
+            except Exception as e_sync:
+                conn_sync.rollback()
+                logging.error(f"Erro ao salvar pedidos sincronizados na fila do banco: {e_sync}")
+            finally:
+                conn_sync.close()
                     
         pagina += 1
         
@@ -638,17 +789,39 @@ def handle_bling_webhook():
     if not entity_id:
         return jsonify({"message": "ID nao encontrado"}), 200
 
-    # --- DESDUPLICAÇÃO EM TEMPO REAL ---
-    category = 'order' if event_type.startswith('order.') else 'product'
-    queue_key = (conta_bling, category, entity_id)
+    # --- ENFILEIRAMENTO PERSISTENTE NO BANCO DE DADOS ---
+    conn = get_db_connection()
+    if conn:
+        try:
+            with conn.cursor() as cursor:
+                insert_sql = f"""
+                    INSERT INTO {FILA_TABLE_NAME} (conta_bling, event_type, entity_id, payload_date, raw_data, status)
+                    VALUES (%s, %s, %s, %s, %s, 'pendente')
+                    ON CONFLICT (conta_bling, event_type, entity_id) WHERE status IN ('pendente', 'processando')
+                    DO NOTHING
+                    RETURNING id
+                """
+                cursor.execute(insert_sql, (
+                    conta_bling,
+                    event_type,
+                    entity_id,
+                    payload.get('date'),
+                    json.dumps(data_obj)
+                ))
+                row = cursor.fetchone()
+                conn.commit()
+                if row:
+                    logging.info(f"📥 [Banco] Webhook Enfileirado #{row[0]}: {event_type} - {entity_id} ({conta_bling})")
+                else:
+                    logging.info(f"⏭️ [Banco] Webhook Duplicado Ignorado (Já na fila): {event_type} - {entity_id}")
+                return jsonify({"status": "queued"}), 200
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Erro ao inserir na fila do banco: {e}. Usando fallback na memória.")
+        finally:
+            conn.close()
 
-    with QUEUE_LOCK:
-        if queue_key in PENDING_TASKS:
-            logging.info(f"⏭️ Webhook Duplicado Ignorado (Já na Fila): {event_type} - {entity_id}")
-            return jsonify({"status": "skipped", "reason": "already_queued"}), 200
-        PENDING_TASKS.add(queue_key)
-
-    # --- ENFILEIRAMENTO ---
+    # --- FALLBACK DE EMERGÊNCIA (Caso o banco falhe momentaneamente) ---
     task = {
         'entity_id': entity_id,
         'conta_bling': conta_bling,
@@ -656,12 +829,9 @@ def handle_bling_webhook():
         'payload_date': payload.get('date'),
         'raw_data': data_obj 
     }
-    
     processing_queue.put(task)
-    
-    logging.info(f"📥 Webhook Recebido e Enfileirado: {event_type} - {entity_id} (Fila: {processing_queue.qsize()})")
-
-    return jsonify({"status": "queued"}), 200
+    logging.info(f"📥 [Memória Fallback] Webhook Enfileirado: {event_type} - {entity_id}")
+    return jsonify({"status": "queued_fallback"}), 200
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
